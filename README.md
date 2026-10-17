@@ -139,5 +139,6 @@ structured schema like my prompts do.
 
 ### Task 3
 > reflect on the AI paradoxes you observed.
+
 One AI paradox I keep coming back to is that adding more steps to a system can make it less reliable, not more. Each new component is another point of failure, so the thing that was supposed to make the system stronger ends up being the thing that breaks it. It's like staying indoors waiting for the rain to stop, only to watch it get heavier — at some point you have to live with it and go, because waiting longer doesn't help. I saw this with the LLM comparison step in Task 1: the more rules I added, the more the model sometimes drifted and hallucinated, even though each rule was meant to make it more accurate. There's a related paradox in capability — the model can retrieve a paragraph of text perfectly, but can't reliably do basic arithmetic. It's understandable why these things happen, but I wish I could put more effort into a prompt and get reliability back out, instead of random hallucinations and errors. The effort and the output don't scale the way you'd expect.
 
