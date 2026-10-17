@@ -11,6 +11,10 @@ import math
 import re
 from pathlib import Path
 from typing import Any
+import os
+from langchain_deepseek import ChatDeepSeek
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
 
 
 MCP_URL = "https://ftec5660.ngrok.app/mcp"
@@ -67,6 +71,113 @@ async def load_mcp_tools() -> list[Any]:
     )
     return await client.get_tools()
 
+def response_text(value: Any) -> str:
+    """Convert common LangChain response shapes to text for results.csv."""
+    content = getattr(value, "content", value)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        return "\n".join(parts).strip()
+    if isinstance(content, (dict, list)):
+        return json.dumps(content, ensure_ascii=False)
+    return str(content).strip()
+
+def get_industry(headline):
+    if not headline:
+        return None
+    head = headline.strip()
+    if head.endswith(" Professional"):
+        return head[:-len(" Professional")].strip()
+    return head
+
+def parse_mcp_output(result):
+    """MCP tools return [{"type": "text", "text": "JSON"}]. Parse inner JSON."""
+    if isinstance(result, list) and result and isinstance(result[0], dict):
+        result = result[0].get("text", result)
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except json.JSONDecodeError:
+            return result
+    return result
+
+def norm(text):
+    if not text:
+        return ""
+    return " ".join(str(text).lower().split())
+
+def text_match(a, b):
+    na, nb = norm(a), norm(b)
+    if not na or not nb:
+        return False
+    return na == nb
+
+def year_match(cv_year, profile_year):
+    if cv_year is None or profile_year is None:
+        return True
+    try:
+        return int(cv_year) == int(profile_year)
+    except (ValueError, TypeError):
+        return True
+
+def python_compare(cv_extract, linkedin, cv_file, candidate_id):
+    prefix = f"[{cv_file}] candidate {candidate_id}:" if candidate_id else f"[{cv_file}]:"
+    discrepancies = []
+
+    if not text_match(cv_extract.get("name"), linkedin.get("name")):
+        print(f"{prefix} Name discrepancy: CV '{cv_extract.get('name')}' vs LinkedIn '{linkedin.get('name')}'")
+        discrepancies.append("name")
+
+    if not text_match(cv_extract.get("city"), linkedin.get("city")):
+        print(f"{prefix} City discrepancy: CV '{cv_extract.get('city')}' vs LinkedIn '{linkedin.get('city')}'")
+        discrepancies.append("city")
+
+    cv_experience = cv_extract.get("experience") or []
+    linkedin_experience = linkedin.get("experience") or []
+    for cv_job in cv_experience:
+        cv_company = cv_job.get("company", "")
+        linkedin_match = None
+        for linked_job in linkedin_experience:
+            if text_match(cv_company, linked_job.get("company", "")):
+                linkedin_match = linked_job
+                break
+        if not linkedin_match:
+            linkedin_companies = [j.get("company", "") for j in linkedin_experience]
+            print(f"{prefix} Employer discrepancy: CV '{cv_company}' vs LinkedIn {linkedin_companies}")
+            discrepancies.append("employer")
+            continue
+        if not year_match(cv_job.get("start_year"), linkedin_match.get("start_year")):
+            print(f"{prefix} Start year discrepancy at '{cv_company}': CV {cv_job.get('start_year')} vs LinkedIn {linkedin_match.get('start_year')}")
+            discrepancies.append("start_year")
+        if not year_match(cv_job.get("end_year"), linkedin_match.get("end_year")):
+            print(f"{prefix} End year discrepancy at '{cv_company}': CV {cv_job.get('end_year')} vs LinkedIn {linkedin_match.get('end_year')}")
+            discrepancies.append("end_year")
+
+    cv_education = cv_extract.get("education") or []
+    linkedin_education = linkedin.get("education") or []
+    for cv_edu in cv_education:
+        cv_school = cv_edu.get("school", "")
+        linkedin_match = None
+        for linked_edu in linkedin_education:
+            if text_match(cv_school, linked_edu.get("school", "")):
+                linkedin_match = linked_edu
+                break
+        if not linkedin_match:
+            linkedin_schools = [e.get("school", "") for e in linkedin_education]
+            print(f"{prefix} School discrepancy: CV '{cv_school}' vs LinkedIn {linkedin_schools}")
+            discrepancies.append("school")
+            continue
+        if not year_match(cv_edu.get("end_year"), linkedin_match.get("end_year")):
+            print(f"{prefix} Grad year discrepancy at '{cv_school}': CV {cv_edu.get('end_year')} vs LinkedIn {linkedin_match.get('end_year')}")
+            discrepancies.append("grad_year")
+
+    return discrepancies
 
 def build_agent(tools: list[Any]) -> Any:
     """Create and return your agent once.
@@ -82,9 +193,115 @@ def build_agent(tools: list[Any]) -> Any:
     Use the DeepSeek model named by ``MODEL_NAME``. The API key is loaded
     from .env.
     """
+    extract_from_cv_PROMPT = """
+            You are reading a CV.
+        
+            Return ONLY a JSON object with exactly these keys:
+           {{
+            "name": "string",
+            "city": "string (city only, no country)",
+            "country": "string or null",
+            "headline": "string or null",
+            "experience": [
+                {{
+                "company": "string",
+                "title": "string (full title as written)",
+                "seniority": "junior | mid | senior | null",
+                "start_year": integer or null,
+                "end_year": integer or null,
+                "is_current": boolean
+                }}
+            ],
+            "education": [
+                {{
+                "school": "string",
+                "degree": "string",
+                "field": "string",
+                "end_year": integer or null
+                }}
+            ],
+            "skills": [
+                {{ "name": "string" }}
+            ]
+            }}
+            RULES:
+            - Use exact key names. Do NOT rename.
+            - "city" is the city name only. "country" is separate.
+            - Years are integers. If "Present", end_year=null and is_current=true.
+            - "title" is the FULL title. Also extract "seniority" separately.
+            - "headline" is the line below the name. If missing, null.
+            - "skills" entries are objects, each with a single "name" key.
+            - Ignore descriptions, bullets, hometown.
+            - Return ONLY JSON.
+            - CRITICAL: If the CV title has no seniority word, "seniority" MUST be null.
+            - "education.end_year" is the graduation year.
+            - Missing scalar fields (name, city, country, headline): use null.
+            - Empty list fields (experience, education, skills): use [].
+            Do NOT guess. Do NOT infer from the title. Do NOT copy a value from elsewhere.
+
+            CV:
+            {cv_text}
+
+            Return ONLY the JSON. No explanation. No markdown fences.
+            """
+    compare_cv_with_linkedin_PROMPT = """   
+    You are comparing a CV against a LinkedIn profile's judgment fields.
+
+        CV fields:
+        - experience: {cv_experience}
+        - education: {cv_education}
+        - skills: {cv_skills}
+
+        Linkedin fields:
+        - experience: {linkedin_experience}
+        - education: {linkedin_education}
+        - skills: {linkedin_skills}
+
+        Rules:
+        - "Senior Manager" on the CV vs "Manager" with seniority=senior on the profile -> NOT a discrepancy.
+        - "Senior Manager" on the CV vs "Manager" with seniority=junior on the profile -> IS a discrepancy.
+        - "BSc" vs "Bachelor of Science" -> NOT a discrepancy (same degree, different wording).
+        - "UI/UX Design" vs "UI/UX" -> NOT a discrepancy (same skill, different wording).
+        - Job start_year or end_year differing between CV and profile -> IS a discrepancy.
+        - Education end_year (graduation year) differing between CV and profile -> IS a discrepancy.
+        - If one side has a null year and the other has a value, do NOT flag — missing data is not a discrepancy.
+        - Compare skills by the "name" field on both sides. Ignore "proficiency".
+        - A CV skill whose name is not in the profile's skill names -> IS a discrepancy.
+        - Fewer skills on the CV than the profile -> NOT a discrepancy.
+        Seniority rule:
+        - If the CV seniority is null, do NOT flag a seniority discrepancy.
+        A CV that omits seniority is being terse, not lying.
+        - Only flag a seniority discrepancy when BOTH sides state a seniority AND they differ.
+
+        Return ONLY JSON:
+        {{"discrepancies": ["description 1", "description 2"]}}
+
+        If no discrepancies: {{"discrepancies": []}}
+        """
     ### YOUR CODE HERE
-    _ = tools
-    return None
+    llm = ChatDeepSeek(
+        model=MODEL_NAME,
+        api_key=os.environ["DEEPSEEK_API_KEY"],
+        temperature=0.0,
+    )
+    parser = JsonOutputParser()
+
+    extract_prompt = ChatPromptTemplate.from_messages([
+        ("system", extract_from_cv_PROMPT),
+    ])
+    compare_prompt = ChatPromptTemplate.from_messages([
+        ("system", compare_cv_with_linkedin_PROMPT),
+    ])
+
+    mcp_tools = {t.name: t for t in tools}
+
+    return {
+        "extract_from_cv": extract_prompt | llm,
+        "compare_cv_linkedin": compare_prompt | llm,
+        "search_linkedin": mcp_tools["search_linkedin_people"],
+        "fetch_linkedin": mcp_tools["get_linkedin_profile"],
+        "parser":parser
+    }
 
 
 async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
@@ -106,8 +323,83 @@ async def score_cvs(agent: Any, cvs: dict[str, str]) -> dict[str, float | None]:
     shared by the whole class.
     """
     ### YOUR CODE HERE
-    _ = agent
-    return {name: None for name in cvs}
+    sem = asyncio.Semaphore(3)
+
+    async def one_cv(cv_file, cv_text):
+        async with sem:
+            try:
+                #Grabbed data from CV and parsed it
+                extract_cv = await agent["extract_from_cv"].ainvoke({"cv_text": cv_text})
+                parsed_extract_from_cv = agent["parser"].parse(response_text(extract_cv))
+
+                
+                #search using name, city, and industry
+                cv_name = parsed_extract_from_cv.get("name","")
+                cv_city = parsed_extract_from_cv.get("city","")
+                cv_industry = get_industry(parsed_extract_from_cv.get("headline",""))
+
+                if not cv_name:
+                    print(f"[{cv_file}] has no name, That's an automatic zero")
+                    return cv_file, 0.0
+
+                
+                search_link = {"q": cv_name}
+                if cv_city:
+                    search_link["location"] = cv_city
+                if cv_industry:
+                    search_link["industry"] = cv_industry
+
+
+                search_linkedin = await agent["search_linkedin"].ainvoke(search_link)
+                parsed_search_linkedin= parse_mcp_output(search_linkedin)
+
+                if not parsed_search_linkedin:
+                    print(f"[{cv_file}] has been searched on Linkedin and nothing returned so that's another automatic zero")
+                    return cv_file, 0.0
+
+                profiles = []
+                for profile in parsed_search_linkedin:
+                    pid = profile.get("id")
+                    if not pid:
+                        continue
+                    full_p = await agent["fetch_linkedin"].ainvoke({"person_id": pid})
+                    parsed_full_p = parse_mcp_output(full_p)
+                    if isinstance(parsed_full_p , dict) and "error" not in parsed_full_p :
+                        print(f"[{cv_file}] added candidate ID: {pid}")
+                        profiles.append(parsed_full_p )
+
+                print(f"[{cv_file}] {len(profiles)} candidates found on LinkedIn, let's see what we can find.")
+                for candidate in profiles:
+                    if python_compare(parsed_extract_from_cv, candidate, cv_file, candidate.get("id")):
+                        continue
+
+                    llm_compare = {
+                        "cv_experience": json.dumps(parsed_extract_from_cv.get("experience", [])),
+                        "cv_education": json.dumps(parsed_extract_from_cv.get("education", [])),
+                        "cv_skills": json.dumps(parsed_extract_from_cv.get("skills", [])),
+                        "linkedin_experience": json.dumps(candidate.get("experience", [])),
+                        "linkedin_education": json.dumps(candidate.get("education", [])),
+                        "linkedin_skills": json.dumps(candidate.get("skills", [])),
+                    }
+                    extract_llm = await agent["compare_cv_linkedin"].ainvoke(llm_compare)
+                    parsed_extract_llm = agent["parser"].parse(response_text(extract_llm))
+                    if parsed_extract_llm.get("discrepancies"):
+                        print(f"[{cv_file}] candidate {candidate.get('id')} failed LLM compare: {parsed_extract_llm['discrepancies']}")
+                        continue
+                    if not parsed_extract_llm.get("discrepancies"):
+                        print(f"[{cv_file}] has found a match and therefore this file has been accepted")
+                        return cv_file, 1.0
+                
+                print(f"[{cv_file}] didn't pass the judgement and discrepancies have been found")
+                return cv_file, 0.0
+
+            except Exception as e:
+                print(f"[{cv_file}] has caused an error and will return a 0.0")
+                return cv_file, 0.0
+
+    tasks = [one_cv(f, t) for f, t in cvs.items()]
+    return dict(await asyncio.gather(*tasks))
+
 
 
 # Everything below is provided runner/scoring code. No edits are needed.
